@@ -1,0 +1,174 @@
+name: Build llama-server CUDA for Colab
+
+on:
+  workflow_dispatch: # GitHubのActionsタブから手動実行可能
+    inputs:
+      force:
+        description: 'ビルド済みでも強制的にビルドし直す'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 0 * * 0' # 毎週日曜日に最新リリースを確認（新しい版があればビルド）
+
+permissions:
+  contents: read # 既定は読み取りのみ。書き込みは必要なジョブだけに付与
+
+concurrency:
+  group: build-cuda
+  cancel-in-progress: false
+
+jobs:
+  # 1) llama.cpp の最新リリースを調べ、自分のリポジトリに同名リリースがあるか確認
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.latest.outputs.tag }}
+      name: ${{ steps.latest.outputs.name }}
+      exists: ${{ steps.exists.outputs.exists }}
+    steps:
+      - name: Get latest llama.cpp release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IFS=$'\t' read -r TAG NAME < <(
+            gh api repos/ggml-org/llama.cpp/releases/latest --jq '[.tag_name, (.name // "")] | @tsv'
+          )
+          if [ -z "$TAG" ]; then
+            echo "Failed to get latest release tag." >&2
+            exit 1
+          fi
+          [ -z "$NAME" ] && NAME="$TAG"
+          echo "Latest llama.cpp release: $TAG ($NAME)"
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already built
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.latest.outputs.tag }}
+        run: |
+          if OUT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" 2>&1); then
+            echo "Release $TAG already exists."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif echo "$OUT" | grep -qi "release not found"; then
+            echo "Release $TAG not found. Will build."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            # API障害などで判定できない場合は、誤ってビルドしないよう失敗させる
+            echo "Failed to check release: $OUT" >&2
+            exit 1
+          fi
+
+  # 2) 未ビルド、または強制ビルド指定の場合にビルドして公開
+  build-cuda:
+    needs: check
+    if: needs.check.outputs.exists == 'false' || inputs.force
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: write # Releasesへのアップロード権限
+    container:
+      # ColabのCUDAドライバと互換性の高いCUDA 12.4 develコンテナを使用
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      ASSET: llama-server-colab-cuda.tar.gz # 固定名（releases/latest/download/ で常に最新を取得可能）
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git cmake build-essential tar ca-certificates
+
+      - name: Clone llama.cpp (${{ env.TAG }})
+        run: |
+          git clone --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+
+      - name: Build llama-server (static, CUDA SM 75 / 80 / 89)
+        run: |
+          # BUILD_SHARED_LIBS=OFF : libllama / libggml を静的リンク
+          #                         （CUDAランタイム libcudart / libcublas はColab側のものを使用）
+          # GGML_NATIVE=OFF       : ビルドマシンのCPU専用命令を使わない（Illegal instruction対策）
+          # AVX2/FMA/F16C/BMI2    : Colabのホストが確実に対応している命令セットを明示的に有効化
+          # *-real                : T4(75) / A100(80) / L4(89) 向けの機械語のみ生成（PTXを省きビルド短縮）
+          # LLAMA_CURL=OFF        : モデルは別途ダウンロードするため、ダウンロード機能は不要
+          cmake -B /tmp/llama.cpp/build -S /tmp/llama.cpp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;89-real" \
+            -DLLAMA_CURL=OFF
+          # nvccはメモリを多く使うため、メモリ不足で落ちる場合は -j 2 程度に下げる
+          cmake --build /tmp/llama.cpp/build --config Release --target llama-server -j $(nproc)
+
+      - name: Verify binary
+        run: |
+          BIN=/tmp/llama.cpp/build/bin/llama-server
+          ldd "$BIN"
+          # libllama / libggml が動的リンクされていないこと（静的リンクの確認）
+          if ldd "$BIN" | grep -E "libllama|libggml"; then
+            echo "llama/ggml libraries are dynamically linked." >&2
+            exit 1
+          fi
+          # libcuda.so.1 はColab側のドライバが提供するので除外。それ以外が欠けていたら失敗
+          if ldd "$BIN" | grep "not found" | grep -v "libcuda.so"; then
+            echo "Unresolved shared libraries found." >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p /tmp/package
+          cp /tmp/llama.cpp/build/bin/llama-server /tmp/package/
+          tar -czf "/tmp/$ASSET" -C /tmp/package .
+          cd /tmp && sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ${{ needs.check.outputs.name }}
+          body: |
+            Built from [ggml-org/llama.cpp ${{ needs.check.outputs.tag }}](https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check.outputs.tag }}) for Google Colab (T4 / L4 / A100).
+            Static build of `llama-server` (CUDA 12.4, SM 75 / 80 / 89). CUDA runtime libraries (`libcudart.so.12`, `libcublas.so.12`) are provided by the Colab environment.
+
+            ```bash
+            wget -q https://github.com/${{ github.repository }}/releases/latest/download/llama-server-colab-cuda.tar.gz
+            tar -xzf llama-server-colab-cuda.tar.gz
+            # libcudart / libcublas が見つからない場合は LD_LIBRARY_PATH を指定
+            LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH ./llama-server -m model.gguf -ngl 99 --port 8080
+            ```
+          files: |
+            /tmp/${{ env.ASSET }}
+            /tmp/${{ env.ASSET }}.sha256
+          overwrite_files: true # 強制ビルド時は既存ファイルを置き換える
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 3) ビルド・公開が失敗/中断した場合、今回新規に作られたリリースとタグを削除
+  #    （別ジョブにすることで、ランナー異常終了やタイムアウト時も確実に実行される）
+  #    ※強制ビルドで既存リリースを作り直していた場合は、既存リリースを守るため削除しない
+  cleanup:
+    needs: [check, build-cuda]
+    if: (failure() || cancelled()) && needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Delete incomplete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Deleting incomplete release $TAG"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          else
+            echo "No release $TAG to delete."
+          fi
