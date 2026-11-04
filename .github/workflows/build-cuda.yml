@@ -66,12 +66,14 @@ jobs:
     needs: check
     if: needs.check.outputs.exists == 'false' || inputs.force
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     permissions:
       contents: write # Releasesへのアップロード権限
     container:
-      # ColabのCUDAドライバと互換性の高いCUDA 12.4 develコンテナを使用
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      # ColabはCUDA 13系（libcudart.so.13 / libcublas.so.13）を提供しているため、CUDA 13.0でビルド
+      # 13.0にしておけば、Colab側が13.x系のどのマイナー版でも動く（同一メジャー内は後方互換）
+      # ※ColabのCUDAメジャー版が変わったら、ここを合わせて変更する
+      image: nvidia/cuda:13.0.1-devel-ubuntu22.04
     env:
       TAG: ${{ needs.check.outputs.tag }}
       ASSET: llama-server-colab-cuda.tar.gz # 固定名（releases/latest/download/ で常に最新を取得可能）
@@ -87,13 +89,13 @@ jobs:
         run: |
           git clone --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
 
-      - name: Build llama-server (static, CUDA SM 75 / 80 / 89)
+      - name: Build llama-server (static, CUDA SM 75 / 80 / 89 / 90)
         run: |
           # BUILD_SHARED_LIBS=OFF : libllama / libggml を静的リンク
           #                         （CUDAランタイム libcudart / libcublas はColab側のものを使用）
           # GGML_NATIVE=OFF       : ビルドマシンのCPU専用命令を使わない（Illegal instruction対策）
           # AVX2/FMA/F16C/BMI2    : Colabのホストが確実に対応している命令セットを明示的に有効化
-          # *-real                : T4(75) / A100(80) / L4(89) 向けの機械語のみ生成（PTXを省きビルド短縮）
+          # *-real                : T4(75) / A100(80) / L4(89) / H100(90) 向けの機械語のみ生成（PTXを省きビルド短縮）
           # LLAMA_CURL=OFF        : モデルは別途ダウンロードするため、ダウンロード機能は不要
           cmake -B /tmp/llama.cpp/build -S /tmp/llama.cpp \
             -DCMAKE_BUILD_TYPE=Release \
@@ -101,7 +103,7 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
             -DGGML_CUDA=ON \
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;89-real" \
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;80-real;89-real;90-real" \
             -DLLAMA_CURL=OFF
           # nvccはメモリを多く使うため、メモリ不足で落ちる場合は -j 2 程度に下げる
           cmake --build /tmp/llama.cpp/build --config Release --target llama-server -j $(nproc)
@@ -134,8 +136,8 @@ jobs:
           tag_name: ${{ needs.check.outputs.tag }}
           name: ${{ needs.check.outputs.name }}
           body: |
-            Built from [ggml-org/llama.cpp ${{ needs.check.outputs.tag }}](https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check.outputs.tag }}) for Google Colab (T4 / L4 / A100).
-            Static build of `llama-server` (CUDA 12.4, SM 75 / 80 / 89). CUDA runtime libraries (`libcudart.so.12`, `libcublas.so.12`) are provided by the Colab environment.
+            Built from [ggml-org/llama.cpp ${{ needs.check.outputs.tag }}](https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check.outputs.tag }}) for Google Colab (T4 / L4 / A100 / H100).
+            Static build of `llama-server` (CUDA 13.0, SM 75 / 80 / 89 / 90). CUDA runtime libraries (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) are provided by the Colab environment.
 
             ```bash
             wget -q https://github.com/${{ github.repository }}/releases/latest/download/llama-server-colab-cuda.tar.gz
